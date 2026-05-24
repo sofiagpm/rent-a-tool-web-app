@@ -696,14 +696,25 @@ const App = (() => {
   function rentalActions(r, role) {
     const actions = [];
 
-    // UC-06: Check-in — quando o aluguer está CONFIRMADO/PENDENTE
+    // UC-06: Check-in com código de pairing — quando CONFIRMADO/PENDENTE
     if (r.state === "CONFIRMADO" || r.state === "PENDENTE") {
-      const ck = r.checkin || { ownerConfirmed: false, renterConfirmed: false };
-      const meDid = (role === "owner" && ck.ownerConfirmed) || (role === "renter" && ck.renterConfirmed);
-      if (!meDid) {
-        actions.push(`<button class="btn btn--primary" data-action="checkin">✅ Confirmar check-in</button>`);
-      } else {
-        actions.push(`<span class="badge badge--info">✓ Já confirmou — a aguardar a contraparte</span>`);
+      const stage = Rentals.checkinStage(r);
+      if (role === "owner") {
+        if (stage === "AWAIT_OWNER" || stage === "EXPIRED") {
+          const label = stage === "EXPIRED" ? "🔄 Gerar novo código" : "🔑 Gerar código de levantamento";
+          actions.push(`<button class="btn btn--primary" data-action="checkin-owner">${label}</button>`);
+        } else if (stage === "AWAIT_RENTER") {
+          actions.push(`<button class="btn btn--ghost" data-action="checkin-show-code">📲 Ver código gerado</button>`);
+        }
+      }
+      if (role === "renter") {
+        if (stage === "AWAIT_OWNER") {
+          actions.push(`<span class="badge badge--warn">A aguardar que o proprietário gere o código de levantamento</span>`);
+        } else if (stage === "AWAIT_RENTER") {
+          actions.push(`<button class="btn btn--primary" data-action="checkin-renter">🔓 Inserir código de levantamento</button>`);
+        } else if (stage === "EXPIRED") {
+          actions.push(`<span class="badge badge--bad">O código expirou — a aguardar novo código do proprietário</span>`);
+        }
       }
     }
 
@@ -731,7 +742,9 @@ const App = (() => {
     UI.$$("[data-action]").forEach(btn => {
       const action = btn.dataset.action;
       btn.addEventListener("click", () => {
-        if (action === "checkin") openCheckinModal(rental);
+        if (action === "checkin-owner") openCheckinOwnerModal(rental);
+        else if (action === "checkin-renter") openCheckinRenterModal(rental);
+        else if (action === "checkin-show-code") openShowCodeModal(rental);
         else if (action === "checkout") openCheckoutModal(rental);
         else if (action === "review") openReviewModal(rental);
         else if (action === "report") openReportModal(rental);
@@ -739,32 +752,108 @@ const App = (() => {
     });
   }
 
-  function openCheckinModal(r) {
+  // --- US6.1 — Proprietário: regista evidências e gera o código ---
+  function openCheckinOwnerModal(r) {
     UI.openModal({
-      title: "Confirmar check-in (UC-06)",
+      title: "Gerar código de levantamento (UC-06)",
       body: `
-        <p class="text-small text-muted">No encontro físico, confirme que recebeu/entregou a ferramenta em conformidade. Em produção, BR-09 exige ≥ 3 fotografias — aqui simulamos esse registo.</p>
+        <p class="text-small text-muted">No encontro físico, registe o estado da ferramenta. É obrigatório carregar pelo menos ${Rentals.MIN_CHECKIN_PHOTOS} fotografias de evidência (Regra 1). Em seguida é gerado um código de uso único, válido durante ${Rentals.PAIRING_TTL_MIN} minutos, que o arrendatário deverá inserir no dispositivo dele.</p>
+        <div class="card" style="padding:14px;background:var(--c-surface-2);margin-bottom:14px">
+          <p class="text-small mt-0" style="margin-bottom:8px"><strong>📷 Fotografias de evidência</strong></p>
+          <div id="photoSlots" class="flex flex--wrap" style="gap:8px">
+            ${[1,2,3].map(i => `<button type="button" class="btn btn--ghost btn--sm photo-slot" data-i="${i}">+ Foto ${i}</button>`).join("")}
+          </div>
+          <p class="text-small text-muted" style="margin:8px 0 0">Fotos registadas: <strong id="photoCount">0</strong> / ${Rentals.MIN_CHECKIN_PHOTOS} (simulação)</p>
+        </div>
         <label class="field">
           <span class="field__label">Notas (opcional)</span>
           <textarea name="notes" class="textarea" placeholder="Ex.: ferramenta em bom estado, sem riscos visíveis."></textarea>
         </label>
-        <div class="card" style="padding:12px;background:var(--c-surface-2)">
-          <p class="text-small mt-0" style="margin-bottom:6px"><strong>📷 Fotos de evidência</strong></p>
-          <p class="text-small text-muted" style="margin:0">3 fotografias registadas automaticamente (simulação).</p>
-        </div>
       `,
       foot: `
         <button class="btn btn--ghost" data-close-modal>Cancelar</button>
-        <button class="btn btn--primary" id="confirmCheckin">Confirmar</button>
+        <button class="btn btn--primary" id="genCode" disabled>Gerar código</button>
       `
     });
-    UI.$("#confirmCheckin").addEventListener("click", () => {
+
+    let photos = 0;
+    const countEl = UI.$("#photoCount");
+    const genBtn = UI.$("#genCode");
+    UI.$$(".photo-slot").forEach(slot => {
+      slot.addEventListener("click", () => {
+        if (slot.dataset.done) return;
+        slot.dataset.done = "1";
+        slot.textContent = "✓ Foto " + slot.dataset.i;
+        slot.classList.add("btn--primary");
+        slot.classList.remove("btn--ghost");
+        photos++;
+        countEl.textContent = photos;
+        if (photos >= Rentals.MIN_CHECKIN_PHOTOS) genBtn.disabled = false;
+      });
+    });
+
+    genBtn.addEventListener("click", () => {
       const notes = UI.$("textarea[name='notes']").value;
-      const res = Rentals.checkIn({ rentalId: r.id, notes });
-      UI.closeModal();
+      const res = Rentals.generatePairing({ rentalId: r.id, photos, notes });
       if (!res.ok) { UI.toast(res.error, "bad"); return; }
-      if (res.rental.state === "ATIVO") UI.toast("Check-in concluído por ambas as partes — aluguer ativo!", "good");
-      else UI.toast("Check-in confirmado. A aguardar a contraparte.", "info");
+      UI.closeModal();
+      openShowCodeModal(Rentals.byId(r.id));
+      UI.toast("Código gerado. Partilhe-o presencialmente com o arrendatário.", "good");
+    });
+  }
+
+  // --- US6.1 — Proprietário: rever o código já gerado ---
+  function openShowCodeModal(r) {
+    const ck = r.checkin || {};
+    const expMs = ck.codeExpiresAt ? new Date(ck.codeExpiresAt).getTime() : 0;
+    UI.openModal({
+      title: "Código de levantamento",
+      body: `
+        <p class="text-small text-muted">Mostre este código ao arrendatário. Ele deve inseri-lo no dispositivo dele para concluir o check-in. O código é de uso único.</p>
+        <div class="text-center" style="padding:18px 0">
+          <div style="font-family:var(--f-display);font-size:2.8rem;font-weight:800;letter-spacing:.3em;color:var(--c-accent-deep)">${UI.esc(ck.code || "------")}</div>
+          <p class="text-small" id="ttlLine" style="color:var(--c-muted);margin-top:8px"></p>
+        </div>
+      `,
+      foot: `<button class="btn btn--primary" data-close-modal>Fechar</button>`
+    });
+    const ttlLine = UI.$("#ttlLine");
+    function tick() {
+      const left = Math.max(0, Math.floor((expMs - Date.now()) / 1000));
+      if (left <= 0) { ttlLine.textContent = "⚠ Código expirado. Gere um novo."; ttlLine.style.color = "var(--c-bad)"; return; }
+      const m = String(Math.floor(left / 60)).padStart(2, "0");
+      const s = String(left % 60).padStart(2, "0");
+      ttlLine.textContent = `Válido por mais ${m}:${s}`;
+      setTimeout(tick, 1000);
+    }
+    tick();
+  }
+
+  // --- US6.1 — Arrendatário: insere o código recebido ---
+  function openCheckinRenterModal(r) {
+    UI.openModal({
+      title: "Inserir código de levantamento (UC-06)",
+      body: `
+        <p class="text-small text-muted">Insira o código de 6 dígitos que o proprietário lhe forneceu no momento da entrega. Ao validar, o aluguer fica ativo (sincronização bilateral — Regra 4).</p>
+        <label class="field">
+          <span class="field__label">Código de levantamento</span>
+          <input name="code" class="input" inputmode="numeric" maxlength="6" placeholder="000000" style="font-size:1.4rem;letter-spacing:.4em;text-align:center" />
+        </label>
+      `,
+      foot: `
+        <button class="btn btn--ghost" data-close-modal>Cancelar</button>
+        <button class="btn btn--primary" id="validateCode">Validar e ativar</button>
+      `
+    });
+    const input = UI.$("input[name='code']");
+    input.focus();
+    UI.$("#validateCode").addEventListener("click", () => {
+      const code = input.value;
+      if (!/^\d{6}$/.test(code.trim())) { UI.toast("O código tem 6 dígitos.", "warn"); return; }
+      const res = Rentals.validatePairing({ rentalId: r.id, code });
+      if (!res.ok) { UI.toast(res.error, "bad"); return; }
+      UI.closeModal();
+      UI.toast("Check-in concluído — aluguer ativo!", "good");
       Router.resolve();
     });
   }
@@ -859,6 +948,8 @@ const App = (() => {
   }
 
   function openReportModal(r) {
+    const tool = Catalog.byId(r.toolId);
+    const value = tool ? (tool.marketValue || tool.deposit || 0) : 0;
     UI.openModal({
       title: "Reportar problema (UC-10)",
       body: `
@@ -875,6 +966,14 @@ const App = (() => {
           <span class="field__label">Descrição</span>
           <textarea name="notes" class="textarea" placeholder="Descreva o sucedido com o máximo de detalhe possível." required></textarea>
         </label>
+
+        <div id="furtoBlock" class="card" style="display:none;padding:12px;background:var(--c-surface-2);margin-bottom:12px">
+          <p class="text-small mt-0" style="margin-bottom:8px"><strong>📄 Queixa policial (obrigatória para furto)</strong></p>
+          <button type="button" class="btn btn--ghost btn--sm" id="policeUpload">+ Anexar queixa policial</button>
+          <span id="policeOk" class="badge badge--good" style="display:none;margin-left:8px">✓ Documento anexado</span>
+        </div>
+
+        <p id="insuranceNote" class="text-small" style="display:none;color:var(--c-accent-deep)"></p>
         <p class="text-small text-muted">O administrador será notificado para mediação. Enquanto o ticket estiver em análise, o aluguer fica em estado "Em disputa".</p>
       `,
       foot: `
@@ -882,14 +981,44 @@ const App = (() => {
         <button class="btn btn--danger" id="submitReport">Reportar</button>
       `
     });
+
+    const typeSel = UI.$("select[name='type']");
+    const furtoBlock = UI.$("#furtoBlock");
+    const insuranceNote = UI.$("#insuranceNote");
+    let policeAttached = false;
+
+    UI.$("#policeUpload").addEventListener("click", () => {
+      policeAttached = true;
+      UI.$("#policeOk").style.display = "inline-flex";
+      UI.$("#policeUpload").disabled = true;
+    });
+
+    function refreshType() {
+      const t = typeSel.value;
+      furtoBlock.style.display = (t === "FURTO") ? "block" : "none";
+      if (t === "DANO" && value >= Rentals.INSURANCE_THRESHOLD) {
+        insuranceNote.style.display = "block";
+        insuranceNote.textContent = `ℹ Valor de mercado ${UI.money(value)} ≥ ${Rentals.INSURANCE_THRESHOLD}€: a seguradora será acionada e os pagamentos congelados (BR-07).`;
+      } else if (t === "FURTO") {
+        insuranceNote.style.display = "block";
+        insuranceNote.textContent = "ℹ Furto aciona automaticamente a seguradora e congela os pagamentos (BR-07).";
+      } else {
+        insuranceNote.style.display = "none";
+      }
+    }
+    typeSel.addEventListener("change", refreshType);
+    refreshType();
+
     UI.$("#submitReport").addEventListener("click", () => {
-      const type = UI.$("select[name='type']").value;
+      const type = typeSel.value;
       const notes = UI.$("textarea[name='notes']").value;
       if (notes.trim().length < 10) { UI.toast("Descreva o incidente com mais detalhe.", "warn"); return; }
-      const res = Rentals.report({ rentalId: r.id, type, notes });
+      if (type === "FURTO" && !policeAttached) { UI.toast("Anexe a queixa policial para reportar um furto.", "warn"); return; }
+      const res = Rentals.report({ rentalId: r.id, type, notes, policeReportAttached: policeAttached, marketValue: value });
       UI.closeModal();
       if (!res.ok) { UI.toast(res.error, "bad"); return; }
-      UI.toast("Problema reportado. O administrador foi notificado.", "info");
+      if (res.insuranceTriggered) UI.toast("Sinistro reportado — seguradora notificada e pagamentos congelados.", "warn");
+      else UI.toast("Problema reportado. O administrador foi notificado.", "info");
       Router.resolve();
     });
   }

@@ -73,10 +73,10 @@ const Auth = (() => {
     if (!birthDate) errors.birthDate = "Indique a data de nascimento.";
     else if (ageFrom(birthDate) < 16) errors.birthDate = "É necessário ter pelo menos 16 anos (BR-01).";
 
-    // Email único
+    // Email único — se já existir, sugerir recuperação (US1.1, Cenário 2)
     const users = Storage.read("users", []);
     if (users.some(u => u.email.toLowerCase() === (email || "").toLowerCase())) {
-      errors.email = "Já existe uma conta com este email.";
+      errors.email = "Já existe uma conta com este email. Tente recuperar o acesso em vez de criar nova conta.";
     }
 
     if (Object.keys(errors).length) return { ok: false, errors };
